@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SUMMARY — The Flaky Network</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --text: #e6e8ec;
+    --muted: #9aa3b2;
+    --accent: #5eb1ff;
+    --good: #4fd88a;
+    --bad: #ff6b6b;
+    --border: #2a2f3a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+    line-height: 1.6;
+  }
+  h1 {
+    font-size: 1.9rem;
+    margin-bottom: 4px;
+  }
+  .subtitle {
+    color: var(--muted);
+    margin-top: 0;
+    margin-bottom: 32px;
+  }
+  h2 {
+    font-size: 1.25rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+    margin-top: 44px;
+  }
+  h3 {
+    font-size: 1.02rem;
+    color: var(--accent);
+    margin-bottom: 6px;
+  }
+  p { color: var(--text); }
+  code, pre {
+    font-family: "SF Mono", Consolas, Monaco, monospace;
+    background: #10131a;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  code {
+    padding: 2px 6px;
+    font-size: 0.88em;
+  }
+  pre {
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    color: #d3d9e6;
+  }
+  .arch {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin: 16px 0;
+  }
+  .flow {
+    font-family: "SF Mono", Consolas, monospace;
+    font-size: 0.82rem;
+    color: var(--muted);
+    white-space: pre;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0 4px;
+    font-size: 0.92rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--muted); font-weight: 600; }
+  .valid { color: var(--good); font-weight: 600; }
+  .invalid { color: var(--bad); font-weight: 600; }
+  .valid::before { content: "\2713  "; }
+  .invalid::before { content: "\2717  "; }
+  ul { padding-left: 22px; }
+  li { margin-bottom: 6px; }
+  .tag {
+    display: inline-block;
+    background: #1c2230;
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 2px 8px;
+    font-size: 0.78rem;
+    font-family: monospace;
+    margin-right: 6px;
+  }
+  .callout {
+    border-left: 3px solid var(--accent);
+    padding: 10px 16px;
+    background: #131722;
+    border-radius: 0 8px 8px 0;
+    margin: 14px 0;
+  }
+  .footer {
+    margin-top: 60px;
+    color: var(--muted);
+    font-size: 0.82rem;
+    border-top: 1px solid var(--border);
+    padding-top: 16px;
+  }
+</style>
+</head>
+<body>
+
+<h1>The Flaky Network — Architecture Summary</h1>
+<p class="subtitle">Sender/receiver design for reliable, low-delay playout over a lossy, jittery, reordering, duplicating UDP relay.</p>
+
+<h2>1. Problem recap</h2>
+<p>
+A harness source emits one 160-byte frame every 20&nbsp;ms, timed to arrive at our sender at exactly
+<code>t0 + i&middot;20ms</code>. The receiver must deliver each frame <code>i</code> to the harness player
+before its playout deadline, <code>t0 + delay_ms + i&middot;20ms</code>, or it counts as a miss. Between the
+sender and receiver sits a hostile relay that drops, delays, reorders, and duplicates packets. The wire format
+between our two processes was entirely our design; only the harness-facing legs (fixed 4-byte big-endian seq +
+160-byte payload) were constrained.
+</p>
+<p>
+A run is <strong>VALID</strong> only if deadline-miss rate &le; 1.0% <em>and</em> bandwidth overhead &le; 2.0&times;
+the raw stream. Among valid runs, lowest <code>delay_ms</code> wins.
+</p>
+
+<h2>2. End-to-end architecture</h2>
+<div class="arch">
+<div class="flow">harness source --47010--&gt; SENDER --47001--&gt; relay --47002--&gt; RECEIVER --47020--&gt; harness player
+                                              ^
+                                              |
+                                     47004 &lt;---- relay &lt;---- 47003  (feedback path — unused)</div>
+</div>
+<p>
+We did not use the feedback path (47003/47004). Early in the process we measured how much a
+NACK-and-resend round trip would cost: at profile B's jitter (up to 80&nbsp;ms one-way), a retransmit
+request-and-reply crosses the hostile relay twice, which can exceed our entire delay budget. We chose a
+purely forward, redundancy-based recovery scheme instead — it costs bandwidth (which we had to spare) rather
+than time (which we didn't).
+</p>
+
+<h2>3. Wire protocol</h2>
+<h3>Header (8 bytes, prepended to every packet we send)</h3>
+<pre>seq       : 4 bytes, big-endian uint32 — frame index i
+type      : 1 byte  — 0 = DATA, 1 = FEC (parity)
+group_n   : 1 byte  — number of frames in this FEC group (3)
+stride    : 1 byte  — spacing between group members (2)
+reserved  : 1 byte
+payload   : 160 bytes — original frame data, or XOR parity</pre>
+
+<h3>Loss recovery: interleaved XOR/FEC</h3>
+<p>
+Every frame is forwarded once, immediately, as a DATA packet — no batching delay on the happy path.
+In parallel, frames are grouped into sets of <span class="tag">GROUP_N = 3</span>, spaced
+<span class="tag">INTERLEAVE = 2</span> apart (frame <code>i</code> shares a group with <code>i+2</code>
+and <code>i+4</code>, not with its immediate neighbor <code>i+1</code>). As soon as a group's third member is
+sent, we XOR the three payloads and send one parity packet covering that group.
+</p>
+<p>
+If exactly one frame in a group is lost, the receiver reconstructs it as
+<code>parity XOR (received members)</code> and forwards the reconstructed frame to the player. This costs a
+fixed <strong>1 parity packet per 3 data packets (~1.33&ndash;1.40&times; overhead)</strong>, comfortably under
+the 2.0&times; cap, and required no retransmission round trip.
+</p>
+<div class="callout">
+<strong>Why interleave instead of grouping consecutive frames?</strong> Grouping <code>{i, i+1, i+2}</code>
+means a burst of 2 consecutive relay drops can land two losses in one group, which single-parity XOR cannot
+recover. Spacing group members 2 frames apart means a burst of 2 consecutive drops lands in two
+<em>different</em> groups instead, each with only one loss — recoverable. Overhead is unchanged either way
+(same 3:1 ratio); only <em>which</em> frames are grouped together changes.
+</div>
+
+<h3>Receiver behavior</h3>
+<ul>
+<li>Forwards every frame — original or reconstructed — the instant it is available, with <strong>no jitter buffer</strong>. This is a deliberate simplification: the harness player only checks whether the correct frame arrived before its own deadline, not arrival order, so buffering to reorder would only add delay for no scoring benefit.</li>
+<li>Tracks per-group state (received mask, forwarded mask, parity, XOR accumulator) in a small circular table indexed by group id, so out-of-order or duplicate arrivals are handled without extra bookkeeping.</li>
+<li>Duplicate DATA/FEC packets (from relay-side duplication) are ignored via the forwarded/received bitmasks — each frame is only sent to the player once.</li>
+</ul>
+
+<h2>4. Tuning process and final numbers</h2>
+<p>
+We started from the naive baseline (forward once, no recovery), confirmed it failed for the expected reason
+(zero redundancy against real loss), then iterated one change at a time:
+</p>
+<ol>
+<li>Added the seq/type header and adjacent-group XOR/FEC (group size 5) — cut misses but left a large residual.</li>
+<li>Diagnosed the residual: most misses were <em>late arrivals</em>, not losses — the network's own jitter tail exceeded our chosen <code>delay_ms</code>. Raised delay to absorb jitter.</li>
+<li>After raising delay, the remaining residual was almost entirely double-losses inside a single FEC group. Shrank group size (5&rarr;3) to cut that probability sharply.</li>
+<li>Compared a further group-size cut (3&rarr;2) against a small delay increase at group size 3; the latter won on every axis (lower miss rate, lower overhead, only 10&nbsp;ms more delay) and was kept.</li>
+<li>Finally switched from adjacent to interleaved grouping (stride 2) as a defensive measure against burst loss, which neither of our two known test profiles exercises but which the relay's Gilbert-Elliott burst model supports and an unseen grading profile might use.</li>
+</ol>
+
+<h3>Final locked configuration</h3>
+<table>
+<tr><th>Parameter</th><th>Value</th></tr>
+<tr><td>FEC group size (<code>GROUP_N</code>)</td><td>3</td></tr>
+<tr><td>Interleave stride</td><td>2</td></tr>
+<tr><td>Playout delay (<code>delay_ms</code>)</td><td><strong>120 ms</strong></td></tr>
+<tr><td>Bandwidth overhead</td><td>~1.40&times; (cap 2.0&times;)</td></tr>
+</table>
+
+<h3>Result on known profiles</h3>
+<table>
+<tr><th>Profile</th><th>Loss</th><th>Delay range</th><th>Miss rate</th><th>Result</th></tr>
+<tr><td>A (mild)</td><td>2%</td><td>10&ndash;40 ms</td><td>0.13%</td><td class="valid">VALID</td></tr>
+<tr><td>B (moderate)</td><td>5%</td><td>20&ndash;80 ms</td><td>0.73%</td><td class="valid">VALID</td></tr>
+</table>
+<p>Both comfortably clear the 1.0% miss cap, giving margin against an unseen grading profile that is somewhat worse than B.</p>
+
+<h2>5. Known limits</h2>
+<ul>
+<li><strong>Two or more losses inside the same FEC group are unrecoverable</strong> — single-parity XOR can only fix one missing member per group. This becomes more likely as loss rate rises above roughly B's 5%, or under burst loss with runs of 3+ consecutive drops.</li>
+<li><strong>Playout delay must exceed the network's real jitter tail</strong> — a profile with a one-way delay ceiling meaningfully above B's 80&nbsp;ms would need more than 120&nbsp;ms of playout delay to stay valid; this is a physical constraint of the network, not something the protocol can work around.</li>
+<li>Retransmission was deliberately not used: at these delay budgets, a NACK-and-resend round trip risks costing more time than we have to spend.</li>
+</ul>
+
+<div class="footer">
+Generated summary of sender/receiver design for the Flaky Network exercise. See <code>RUNLOG.md</code> for the full per-experiment log and <code>NOTES.md</code> for the condensed design statement.
+</div>
+
+</body>
+</html>
